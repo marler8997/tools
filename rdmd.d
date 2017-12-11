@@ -250,23 +250,37 @@ int main(string[] args)
     }
 
     // Fetch dependencies
-    const myDeps = getDependencies(root, workDir, objDir, compilerFlags);
+    const initialDeps = getDependencies(root, workDir, objDir, compilerFlags);
 
-    // --makedepend mode. Just print dependencies and exit.
-    if (makeDepend)
+    // returns: true if should exit
+    bool handleDeps(in string[string] deps) in { assert(deps !is null); } do
     {
-        writeDeps(exe, root, myDeps, stdout);
-        return 0;
+        // --makedepend mode. Just print dependencies and exit.
+        if (makeDepend)
+        {
+            writeDeps(exe, root, deps, stdout);
+            return true; // exit
+        }
+
+        // --makedepfile mode. Print dependencies to a file and continue.
+        // This is similar to GCC's -MF option, very useful to update the
+        // dependencies file and compile in one go:
+        // -include .deps.mak
+        // prog:
+        //      rdmd --makedepfile=.deps.mak --build-only prog.d
+        if (makeDepFile !is null)
+            writeDeps(exe, root, deps, File(makeDepFile, "w"));
+
+        return false; // continue
     }
 
-    // --makedepfile mode. Print dependencies to a file and continue.
-    // This is similar to GCC's -MF option, very useful to update the
-    // dependencies file and compile in one go:
-    // -include .deps.mak
-    // prog:
-    //      rdmd --makedepfile=.deps.mak --build-only prog.d
-    if (makeDepFile !is null)
-        writeDeps(exe, root, myDeps, File(makeDepFile, "w"));
+    if(initialDeps !is null)
+    {
+        if(handleDeps(initialDeps))
+        {
+            return 0;
+        }
+    }
 
     // Compute executable name, check for freshness, rebuild
     /*
@@ -287,7 +301,7 @@ int main(string[] args)
     {
         // user-specified exe name
         buildWitness = buildPath(workDir, ".built");
-        if (!exe.newerThan(buildWitness))
+        if (initialDeps !is null && !exe.newerThan(buildWitness))
         {
             // Both exe and buildWitness exist, and exe is older than
             // buildWitness. This is the only situation in which we
@@ -300,15 +314,18 @@ int main(string[] args)
     {
         exe = buildPath(workDir, exeBasename) ~ outExt;
         buildWitness = exe;
-        yap("stat ", buildWitness);
-        lastBuildTime = buildWitness.timeLastModified(SysTime.min);
+        if(initialDeps !is null)
+        {
+            yap("stat ", buildWitness);
+            lastBuildTime = buildWitness.timeLastModified(SysTime.min);
+        }
     }
 
     // Have at it
-    if (chain(root.only, myDeps.byKey).anyNewerThan(lastBuildTime))
+    if (initialDeps is null || chain(root.only, initialDeps.byKey).anyNewerThan(lastBuildTime))
     {
         immutable result = rebuild(root, exe, workDir, objDir,
-                                   myDeps, compilerFlags, addStubMain);
+                                   compilerFlags, addStubMain);
         if (result)
             return result;
 
@@ -318,6 +335,17 @@ int main(string[] args)
             yap("touch ", buildWitness);
             if (!dryRun)
                 std.file.write(buildWitness, "");
+        }
+    }
+
+    if(initialDeps is null)
+    {
+        auto newDeps = getDependencies(root, workDir, objDir, compilerFlags);
+        assert(newDeps !is null, "code bug: dependencies were not properly generated from the build");
+
+        if(handleDeps(newDeps))
+        {
+            return 0;
         }
     }
 
@@ -459,7 +487,7 @@ private void unlockWorkPath()
 // object file.
 
 private int rebuild(string root, string fullExe,
-        string workDir, string objDir, in string[string] myDeps,
+        string workDir, string objDir,
         string[] compilerFlags, bool addStubMain)
 {
     version (Windows)
@@ -495,11 +523,8 @@ private int rebuild(string root, string fullExe,
             ~ [ "-of" ~ fullExeTemp ]
             ~ [ "-od" ~ objDir ]
             ~ [ "-I" ~ dirName(root) ]
-            ~ [ root ];
-        foreach (k, objectFile; myDeps) {
-            if(objectFile !is null)
-                todo ~= [ k ];
-        }
+            ~ [ root ]
+            ~ [ "-i" ];
         // Need to add void main(){}?
         if (addStubMain)
         {
@@ -590,8 +615,8 @@ private int exec(string[] args)
 
 // Given module rootModule, returns a mapping of all dependees .d
 // source filenames to their corresponding .o files sitting in
-// directory workDir. The mapping is obtained by running dmd -v against
-// rootModule.
+// directory workDir. The mapping is obtained by reading the 'rdmd.deps' file
+// that would have been generated on a previous build.
 
 private string[string] getDependencies(string rootModule, string workDir,
         string objDir, string[] compilerFlags)
@@ -704,37 +729,11 @@ private string[string] getDependencies(string rootModule, string workDir,
                 // Cool, we're in good shape
                 return deps;
             }
-            // Fall through to rebuilding the deps file
+            // Fall through to returning no deps
         }
     }
 
-    immutable rootDir = dirName(rootModule);
-
-    // Filter out -lib. With -o-, it will create an empty library file.
-    compilerFlags = compilerFlags.filter!(flag => flag != "-lib").array();
-
-    // Collect dependencies
-    auto depsGetter =
-        // "cd " ~ shellQuote(rootDir) ~ " && "
-        [ compiler ] ~ compilerFlags ~
-        ["-v", "-o-", rootModule, "-I" ~ rootDir];
-
-    scope(failure)
-    {
-        // Delete the deps file on failure, we don't want to be fooled
-        // by it next time we try
-        collectException(std.file.remove(depsFilename));
-    }
-
-    immutable depsExitCode = run(depsGetter, depsFilename);
-    if (depsExitCode)
-    {
-        stderr.writefln("Failed: %s", depsGetter);
-        collectException(std.file.remove(depsFilename));
-        exit(depsExitCode);
-    }
-
-    return dryRun ? null : readDepsFile();
+    return null; // dependendies are out of date or haven't been calculated yet
 }
 
 // Is any file newer than the given file?
